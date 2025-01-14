@@ -1,0 +1,169 @@
+--обчислення даних по акаунтам. Для цього об’єднуємо таблиці account_session, session, session_params, account. Витягуємо дату, країну, дані про акаунт та рахуємо кількість унікальних акаунтів. Групуємо по всьому крім агрегатної функції.
+
+
+WITH
+  account_part AS (
+  SELECT
+    s.date AS date,
+    sp.country AS country,
+    send_interval,
+    is_verified,
+    is_unsubscribed,
+    COUNT(DISTINCT acc.id) AS account_cnt
+  FROM
+    `DA.account_session`acs
+  JOIN
+    `DA.session`s
+  ON
+    acs.ga_session_id = s.ga_session_id
+  JOIN
+    `DA.session_params`sp
+  ON
+    acs.ga_session_id = sp.ga_session_id
+  JOIN
+    `DA.account`acc
+  ON
+    acs.account_id = acc.id
+  GROUP BY
+    s.date,
+    sp.country,
+    send_interval,
+    is_verified,
+    is_unsubscribed ),
+
+
+  --обчислення даних по емейлам. Для цього об’єднуємо таблиці email_sent, account_session, account, session, session_params, email_open, email_visit. Все inner join, але відкриті та кліктуті емейли - left join, тому що ми не хочемо втратити ті листи, які були тільки відправлені.
+--Витягуємо дату, країну, дані про акаунт та рахуємо кількість унікальних листів (відправлених, відкритих, клікнутих). Групуємо по всьому крім агрегатних функцій.
+
+  email_metrics_part AS(
+SELECT
+  DATE_ADD(s.date, INTERVAL es.sent_date day) AS sent_date,
+  sp.country AS country,
+  send_interval,
+  is_verified,
+  is_unsubscribed,
+  COUNT(DISTINCT es.id_message) AS sent_msg,
+  COUNT(DISTINCT eo.id_message) AS open_msg,
+  COUNT(DISTINCT ev.id_message) AS visit_msg
+FROM
+  `DA.email_sent`es
+JOIN
+  `DA.account_session` acs
+ON
+  es.id_account = acs.account_id
+JOIN
+  `DA.account` acc
+ON
+  acc.id = acs.account_id
+JOIN
+  `DA.session` s
+ON
+  acs.ga_session_id = s.ga_session_id
+JOIN
+  `DA.session_params` sp
+ON
+  sp.ga_session_id = s.ga_session_id
+LEFT JOIN
+  `DA.email_open`eo
+ON
+  es.id_message = eo.id_message
+LEFT JOIN
+  `DA.email_visit`ev
+ON
+  es.id_message = ev.id_message
+GROUP BY
+  DATE_ADD(s.date, INTERVAL es.sent_date day),
+  sp.country,
+  send_interval,
+  is_verified,
+  is_unsubscribed ),
+
+
+  --об'єднання акаунтів та емейлів через UNION ALL. Це потрібно, щоб дві частини (по акаунтах і листах) не  впливали одна на одну
+  final AS (
+  SELECT
+    date,
+    country,
+    send_interval,
+    is_verified,
+    is_unsubscribed,
+    account_cnt,
+    0 AS sent_msg,
+    0 AS open_msg,
+    0 AS visit_msg
+  FROM
+    account_part
+  UNION ALL
+  SELECT
+    sent_date AS date,
+    country,
+    send_interval,
+    is_verified,
+    is_unsubscribed,
+    0 AS account_cnt,
+    sent_msg,
+    open_msg,
+    visit_msg
+  FROM
+    email_metrics_part ),
+
+
+  --об'єднання final в одну таблицю. Берем дані з final та об'єднуємо, щоб не було 0. Групуємо по всьому крім агрегатних функцій.
+  final_all AS (
+SELECT
+  date,
+  country,
+  send_interval,
+  is_verified,
+  is_unsubscribed,
+  SUM(account_cnt) AS account_cnt,
+  SUM(sent_msg) AS sent_msg,
+  SUM(open_msg) AS open_msg,
+  SUM(visit_msg) AS visit_msg
+FROM
+  final
+GROUP BY
+  date,
+  country,
+  send_interval,
+  is_verified,
+  is_unsubscribed ),
+
+
+  --обчислення тоталів. Берем всі дані з final_all. Обчислюємо загальну кількість створених акаунтів по країні (за допомогою партиції групуємо в розрізі країни) та загальну кількість відправлених листів по країн ( за допомогою партиції групуємо в розрізі країни).
+
+
+  total_part AS (
+SELECT
+  *,
+  SUM(account_cnt) OVER (PARTITION BY country) AS total_country_account_cnt,
+  SUM(sent_msg) OVER (PARTITION BY country) AS total_country_sent_cnt
+FROM
+  final_all),
+
+
+  --обчислення ранків. Неможливо обчислити в тотали та ранки в одному СТЕ тому розділяєм ці дані. Берем всі дані з total_part та додатково обчислюємо рейтинг країн за кількістю створених акаунтів (сортуємо за загальною кількістю створених акаунтів по країні) та рейтинг країн за кількістю відправлених листів (сортуємо за загальною кількістю відправлених листів по країні) . DENSE_RANK використовуємо, що row_number рахував би однакові дані по різному, а нам потрібно, щоб кожна країна мала свій ранг.
+
+
+  rank_part AS (
+SELECT
+  *,
+  DENSE_RANK() OVER (ORDER BY total_country_account_cnt DESC) AS rank_total_country_account_cnt,
+  DENSE_RANK() OVER (ORDER BY total_country_sent_cnt DESC) AS rank_total_country_sent_cnt
+FROM
+  total_part)
+
+
+  --виведення всіх даних з rank_part. 
+SELECT
+  *
+FROM
+  rank_part
+ 
+--виконання умови про rank_total_country_account_cnt або rank_total_country_sent_cnt менше або дорівнює 10.
+WHERE
+  rank_total_country_account_cnt <= 10
+  OR rank_total_country_sent_cnt <= 10
+ORDER BY
+  rank_total_country_account_cnt,
+  Rank_total_country_sent_cnt
